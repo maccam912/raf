@@ -18,6 +18,12 @@ class GameScene extends Phaser.Scene {
   private space!: Phaser.Input.Keyboard.Key;
 
   private creatureGraphics: Record<string, Phaser.GameObjects.Arc> = {};
+  private creatureBodies: Record<string, any> = {};
+  private terrainBodies: any[] = [];
+  private lastServerPos: Record<string, { x: number; y: number }> = {};
+  private lastServerTime: Record<string, number> = {};
+  private lastAutoResyncAt: Record<string, number> = {};
+  private localActiveId: string | null = null;
   private lastSent = 0;
 
   private width = 800;
@@ -36,6 +42,9 @@ class GameScene extends Phaser.Scene {
   private dragLast?: Phaser.Math.Vector2;
   private terrainSource: 'unknown' | 'server' | 'client' = 'unknown';
   private posSmoothingTau = 120; // ms time-constant for position smoothing
+  private resyncThreshold = 24; // px divergence before snapping to server
+  private autoResyncIntervalMs = 0; // resync as often as server updates
+  private velocityScale = 0.02; // scale server-estimated velocity for local client feel
 
   constructor() {
     super("game");
@@ -121,15 +130,74 @@ class GameScene extends Phaser.Scene {
           gfx = this.add.circle(c.x, c.y, c.radius, Number(c.color.replace("#", "0x"))).setDepth(3);
           this.creatureGraphics[id] = gfx;
         }
-        // Authoritative position from server with delta-based smoothing
-        const baseAlpha = 1 - Math.exp(-delta / this.posSmoothingTau);
-        const dx = c.x - gfx.x;
-        const dy = c.y - gfx.y;
-        // Speed up catch-up when landing (server Y below current)
-        const fastYAlpha = 1 - Math.exp(-delta / 50);
-        const alphaY = dy > 0 ? Math.max(baseAlpha, fastYAlpha) : baseAlpha;
-        gfx.x += dx * baseAlpha;
-        gfx.y += dy * alphaY;
+        // Ensure physics proxy for non-local-active creatures to enable collisions client-side
+        const isLocalActive = (this.room.sessionId === (stateAny).activePlayerSessionId) && (id === activeId);
+        if (!isLocalActive) {
+          const MatterBody = (Phaser.Physics.Matter as any).Matter.Body;
+          let pbody = this.creatureBodies[id];
+          if (!pbody) {
+            pbody = this.matter.add.circle(c.x, c.y, c.radius, { isStatic: true, friction: 0.8, restitution: 0.35 });
+            this.creatureBodies[id] = pbody;
+          } else if (pbody.isStatic) {
+            MatterBody.setPosition(pbody, { x: c.x, y: c.y });
+          }
+        }
+        // For our locally simulated active creature, render from local physics body.
+        // Otherwise, smooth towards server state for remote creatures.
+        if (this.localActiveId === id && this.creatureBodies[id]) {
+          const body = this.creatureBodies[id];
+          gfx.x = body.position.x;
+          gfx.y = body.position.y;
+        } else {
+          const baseAlpha = 1 - Math.exp(-delta / this.posSmoothingTau);
+          const dx = c.x - gfx.x;
+          const dy = c.y - gfx.y;
+          const fastYAlpha = 1 - Math.exp(-delta / 50);
+          const alphaY = dy > 0 ? Math.max(baseAlpha, fastYAlpha) : baseAlpha;
+          gfx.x += dx * baseAlpha;
+          gfx.y += dy * alphaY;
+        }
+
+        // Track last seen server pos to detect server patches and resync locally if diverged
+        const prev = this.lastServerPos[id];
+        const prevT = this.lastServerTime[id] ?? 0;
+        const nowT = Date.now();
+        const changed = !prev || prev.x !== c.x || prev.y !== c.y;
+        if (changed) {
+          // If this is our locally simulated active creature, optionally resync if far off
+          if (this.localActiveId === id && this.creatureBodies[id]) {
+            const body = this.creatureBodies[id];
+            const dx2 = body.position.x - c.x;
+            const dy2 = body.position.y - c.y;
+            const dist = Math.hypot(dx2, dy2);
+            if (dist > this.resyncThreshold) {
+              const lastAt = this.lastAutoResyncAt[id] ?? 0;
+              const canResync = (nowT - lastAt) >= this.autoResyncIntervalMs;
+              if (canResync) {
+                const MatterBody = (Phaser.Physics.Matter as any).Matter.Body;
+                MatterBody.setPosition(body, { x: c.x, y: c.y });
+                // Apply scaled server-estimated velocity on snap
+                const dtSnap = (nowT - prevT) / 1000;
+                if (prev && dtSnap > 0.0001) {
+                  const srvVx = (c.x - prev.x) / dtSnap;
+                  const srvVy = (c.y - prev.y) / dtSnap;
+                  MatterBody.setVelocity(body, { x: srvVx * this.velocityScale, y: srvVy * this.velocityScale });
+                }
+                this.lastAutoResyncAt[id] = nowT;
+              }
+            }
+            // Even when not snapping, nudge velocity towards scaled server-estimated velocity
+            const dt = (nowT - prevT) / 1000;
+            if (prev && dt > 0.0001) {
+              const srvVx = (c.x - prev.x) / dt;
+              const srvVy = (c.y - prev.y) / dt;
+              const MatterBody = (Phaser.Physics.Matter as any).Matter.Body;
+              MatterBody.setVelocity(body, { x: srvVx * this.velocityScale, y: srvVy * this.velocityScale });
+            }
+          }
+          this.lastServerPos[id] = { x: c.x, y: c.y };
+          this.lastServerTime[id] = nowT;
+        }
       });
     }
 
@@ -138,12 +206,19 @@ class GameScene extends Phaser.Scene {
       if (!seen.has(id)) {
         this.creatureGraphics[id]?.destroy();
         delete this.creatureGraphics[id];
+        if (this.creatureBodies[id]) {
+          try { this.matter.world.remove(this.creatureBodies[id]); } catch {}
+          delete this.creatureBodies[id];
+          if (this.localActiveId === id) this.localActiveId = null;
+        }
       }
     });
 
     // Control only on our active creature
     const isMyTurn = this.room.sessionId === (stateAny).activePlayerSessionId;
     const activeId = (stateAny).activeCreatureId as string;
+    // Ensure local physics body exists only when it's our turn and we have an active creature
+    this.ensureActivePhysics(isMyTurn ? activeId : null);
     if (isMyTurn && activeId) {
       const left = this.cursors.left.isDown || this.wasd.left.isDown;
       const right = this.cursors.right.isDown || this.wasd.right.isDown;
@@ -156,6 +231,21 @@ class GameScene extends Phaser.Scene {
       }
       if (Phaser.Input.Keyboard.JustDown(this.cursors.up) || Phaser.Input.Keyboard.JustDown(this.wasd.up)) {
         this.room.send("jump");
+        // Immediate local responsiveness
+        const body = this.creatureBodies[activeId];
+        if (body) {
+          const MatterBody = (Phaser.Physics.Matter as any).Matter.Body;
+          MatterBody.applyForce(body, body.position, { x: 0, y: -0.03 });
+        }
+      }
+      // Apply held forces locally for responsiveness
+      const body = this.creatureBodies[activeId];
+      if (body) {
+        const MatterBody = (Phaser.Physics.Matter as any).Matter.Body;
+        const forceX = (left ? -0.0015 : 0) + (right ? 0.0015 : 0);
+        if (forceX !== 0) {
+          MatterBody.applyForce(body, body.position, { x: forceX, y: 0 });
+        }
       }
     }
 
@@ -188,6 +278,25 @@ class GameScene extends Phaser.Scene {
     if (Phaser.Input.Keyboard.JustDown(this.keyResync)) {
       this.followEnabled = true;
       this.lastFollowId = null; // force reattach
+      // Force snap local body to latest server state if available
+      const activeId2 = (stateAny).activeCreatureId as string;
+      const creatureMap: any = (stateAny as any).creatures;
+      const c = creatureMap?.get?.(activeId2) ?? creatureMap?.[activeId2];
+      if (activeId2 && this.creatureBodies[activeId2] && c) {
+        const MatterBody = (Phaser.Physics.Matter as any).Matter.Body;
+        const body = this.creatureBodies[activeId2];
+        MatterBody.setPosition(body, { x: c.x, y: c.y });
+        // Use scaled estimated server velocity on manual resync
+        const prev = this.lastServerPos[activeId2];
+        const prevT = this.lastServerTime[activeId2] ?? 0;
+        const nowT = Date.now();
+        const dt = (nowT - prevT) / 1000;
+        if (prev && dt > 0.0001) {
+          const srvVx = (c.x - prev.x) / dt;
+          const srvVy = (c.y - prev.y) / dt;
+          MatterBody.setVelocity(body, { x: srvVx * this.velocityScale, y: srvVy * this.velocityScale });
+        }
+      }
     }
     if (Phaser.Input.Keyboard.JustDown(this.keyZoomOut)) {
       this.cameras.main.setZoom(Phaser.Math.Clamp(this.cameras.main.zoom * 0.9, 0.5, 2));
@@ -223,6 +332,13 @@ class GameScene extends Phaser.Scene {
     // destroy previous terrain if re-drawing
     this.terrainGraphics?.destroy();
     this.waterRect?.destroy();
+    // remove previous physics terrain
+    if (this.terrainBodies.length) {
+      for (const b of this.terrainBodies) {
+        try { this.matter.world.remove(b); } catch {}
+      }
+      this.terrainBodies = [];
+    }
     // water
     // Huge water rectangle from waterline downwards (static, world-aligned)
     this.waterRect = this.add
@@ -251,6 +367,30 @@ class GameScene extends Phaser.Scene {
       g.strokePath();
       g.setDepth(1);
       this.terrainGraphics = g;
+
+      // Build collision segments for terrain (client-side Matter physics)
+      const parts: any[] = [];
+      const thickness = 20;
+      for (let i = 2; i < pts.length; i += 2) {
+        const ax = pts[i - 2];
+        const ay = pts[i - 1];
+        const bx = pts[i];
+        const by = pts[i + 1];
+        const dx = bx - ax;
+        const dy = by - ay;
+        const len = Math.hypot(dx, dy) || 1;
+        const angle = Math.atan2(dy, dx);
+        let nx = -dy / len;
+        let ny = dx / len;
+        if (ny < 0) { nx = -nx; ny = -ny; }
+        const offX = nx * (thickness / 2);
+        const offY = ny * (thickness / 2);
+        const cx = (ax + bx) / 2 + offX;
+        const cy = (ay + by) / 2 + offY;
+        const seg = this.matter.add.rectangle(cx, cy, len, thickness, { isStatic: true, angle, friction: 0.9, restitution: 0.1 });
+        parts.push(seg);
+      }
+      this.terrainBodies = parts;
     }
   }
 
@@ -297,6 +437,39 @@ class GameScene extends Phaser.Scene {
       this.waterRect.y = top + (height / 2);
     }
   }
+
+  // Manage local active creature physics body on client
+  private ensureActivePhysics(activeId: string | null) {
+    if (activeId === this.localActiveId) return;
+
+    // Remove previous local active body
+    if (this.localActiveId && this.creatureBodies[this.localActiveId]) {
+      const old = this.creatureBodies[this.localActiveId];
+      try { this.matter.world.remove(old); } catch {}
+      delete this.creatureBodies[this.localActiveId];
+    }
+
+    this.localActiveId = activeId;
+    if (!activeId) return;
+
+    // Remove any existing proxy body for the new active id
+    if (this.creatureBodies[activeId]) {
+      try { this.matter.world.remove(this.creatureBodies[activeId]); } catch {}
+      delete this.creatureBodies[activeId];
+    }
+
+    // Seed new body from server position
+    const stateAny = this.room.state as any;
+    const cm: any = stateAny?.creatures;
+    const c: Creature | undefined = cm?.get?.(activeId) ?? cm?.[activeId];
+    if (!c) return;
+    const body = this.matter.add.circle(c.x, c.y, c.radius, {
+      restitution: 0.35,
+      friction: 0.8,
+      frictionAir: 0.02,
+    });
+    this.creatureBodies[activeId] = body;
+  }
 }
 
 const config: Phaser.Types.Core.GameConfig = {
@@ -306,7 +479,13 @@ const config: Phaser.Types.Core.GameConfig = {
   backgroundColor: "#1f2630",
   parent: undefined,
   pixelArt: true,
-  // client is render-only; physics runs on server
+  physics: {
+    default: 'matter',
+    matter: {
+      gravity: { y: 1 },
+    }
+  },
+  // client simulates locally for responsiveness; server remains authoritative
   scene: [GameScene],
 };
 
