@@ -1,0 +1,23 @@
+{
+  "name": "client",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "parcel serve index.html --port 1234",
+    "build": "parcel build index.html",
+    "test": "echo \"Error: no test specified\" && exit 0"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "colyseus.js": "^0.16.19",
+    "phaser": "^3.90.0"
+  },
+  "devDependencies": {
+    "parcel": "^2.15.4",
+    "process": "^0.11.10",
+    "typescript": "^5.9.2"
+  }
+}

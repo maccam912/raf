@@ -1,0 +1,13 @@
+{
+  "name": "turn-bonk-workspace",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Root workspace runner for server and client",
+  "scripts": {
+    "dev": "node dev.js",
+    "server": "npm --prefix server run dev",
+    "client": "npm --prefix client run dev",
+    "build": "npm --prefix server run build && npm --prefix client run build"
+  }
+}
+
