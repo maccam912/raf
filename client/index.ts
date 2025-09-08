@@ -71,9 +71,17 @@ class GameScene extends Phaser.Scene {
     this.space = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SPACE);
 
     (document.getElementById("status")!).textContent = "Connecting to server...";
+    // Ask for player name (store in localStorage)
+    const defaultName = localStorage.getItem('playerName') || `Player-${(Math.random()*1000)|0}`;
+    const inputName = (typeof window !== 'undefined' ? window.prompt('Enter your name', defaultName) : defaultName) || defaultName;
+    const name = inputName.trim().slice(0, 24) || defaultName;
+    localStorage.setItem('playerName', name);
     this.client = new Client("ws://localhost:2567");
-    this.room = await this.client.joinOrCreate<RoomState>("rebate_attack_force");
+    this.room = await this.client.joinOrCreate<RoomState>("rebate_attack_force", { name });
     (document.getElementById("status")!).textContent = `Connected. Your session: ${this.room.sessionId}`;
+
+    // If there are disconnected players, offer takeover
+    setTimeout(() => this.offerTakeoverIfAvailable(), 100); // slight delay to ensure state arrives
 
     // Camera controls
     this.keyFollowToggle = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.F);
@@ -249,9 +257,65 @@ class GameScene extends Phaser.Scene {
     // Backdrop is static (no per-frame resizing for performance)
 
     // UI updates
-    (document.getElementById("turn")!).textContent = isMyTurn ? "Your turn" : "Waiting for others";
+    const namesMap: any = (stateAny as any).playerNames || {};
+    const activeName = (namesMap?.get?.(stateAny.activePlayerSessionId)) ?? namesMap?.[stateAny.activePlayerSessionId] ?? stateAny.activePlayerSessionId ?? '';
+    (document.getElementById("turn")!).textContent = `Up: ${activeName || '—'}`;
     const secs = Math.ceil((((stateAny).turnRemainingMs || 0) as number) / 1000);
     (document.getElementById("timer")!).textContent = `Turn ends in: ${secs}s`;
+    // Winner overlay
+    const winnerId = (stateAny as any).winnerSessionId as string;
+    const winnerEl = document.getElementById('winner');
+    if (winnerEl) {
+      if (winnerId && winnerId.length > 0) {
+        const wname = (namesMap?.get?.(winnerId)) ?? namesMap?.[winnerId] ?? winnerId;
+        winnerEl.textContent = `${wname} wins!`;
+        (winnerEl as any).style.display = 'block';
+      } else {
+        (winnerEl as any).style.display = 'none';
+      }
+    }
+
+    // Scoreboard: sum HP per player (100 per alive creature)
+    const hpByOwner = new Map<string, number>();
+    const forEachC = typeof creatures?.forEach === 'function'
+      ? creatures.forEach.bind(creatures)
+      : (cb: Function) => Object.keys(creatures||{}).forEach((id) => cb((creatures as any)[id], id));
+    if (creatures) {
+      forEachC((c: Creature) => {
+        const cur = hpByOwner.get(c.ownerSessionId) || 0;
+        hpByOwner.set(c.ownerSessionId, cur + 100);
+      });
+    }
+    // Build display list of players from names map (fallback to any owner seen)
+    const entries: Array<{ id: string; name: string; hp: number; active: boolean; dc: boolean }> = [];
+    const addEntry = (id: string) => {
+      const nm = (namesMap?.get?.(id)) ?? namesMap?.[id] ?? id;
+      const dcMap: any = (stateAny as any).disconnectedUntil || {};
+      let until = 0;
+      if (typeof dcMap.forEach === 'function') { dcMap.forEach((v: number, key: string) => { if (key === id) until = v; }); }
+      else { until = dcMap?.[id] ?? 0; }
+      const dc = typeof until === 'number' && until > Date.now();
+      entries.push({ id, name: nm, hp: hpByOwner.get(id) || 0, active: id === stateAny.activePlayerSessionId, dc });
+    };
+    if (namesMap) {
+      if (typeof namesMap.forEach === 'function') {
+        namesMap.forEach((_v: string, key: string) => addEntry(key));
+      } else {
+        Object.keys(namesMap).forEach(addEntry);
+      }
+    } else {
+      // fallback: derive from owners present in creatures
+      const owners = new Set<string>();
+      const forEachC2 = forEachC;
+      if (creatures) forEachC2((c: Creature) => owners.add(c.ownerSessionId));
+      owners.forEach(addEntry);
+    }
+    // Sort: active first, then by name
+    entries.sort((a, b) => (b.active?1:0)-(a.active?1:0) || a.name.localeCompare(b.name));
+    const sb = document.getElementById('scoreboard');
+    if (sb) {
+      sb.innerHTML = entries.map(e => `${e.active ? '▶ ' : ''}${e.name}${e.dc ? ' (DC)' : ''}: ${e.hp} HP`).join('<br>');
+    }
 
     // Debug overlay
     const tpObj = (stateAny as any).terrainPoints;
@@ -382,6 +446,36 @@ class GameScene extends Phaser.Scene {
         parts.push(seg);
       }
       this.terrainBodies = parts;
+    }
+  }
+
+  private offerTakeoverIfAvailable() {
+    if (!this.room) return;
+    const stateAny = this.room.state as any;
+    const names: any = stateAny.playerNames || {};
+    const dmap: any = stateAny.disconnectedUntil || {};
+    // Extract disconnected ids still within grace
+    const now = Date.now();
+    const entries: Array<{ id: string; name: string; until: number }> = [];
+    const add = (id: string, until: number) => {
+      if (typeof until === 'number' && until > now) {
+        const nm = names?.get?.(id) ?? names?.[id] ?? id;
+        entries.push({ id, name: nm, until });
+      }
+    };
+    if (typeof dmap.forEach === 'function') {
+      dmap.forEach((until: number, id: string) => add(id, until));
+    } else {
+      Object.keys(dmap || {}).forEach((id) => add(id, (dmap as any)[id]));
+    }
+    if (entries.length === 0) return;
+    const list = entries.map((e, i) => `${i+1}. ${e.name}`).join('\n');
+    const resp = window.prompt(`Take over a disconnected player?\n${list}\nEnter number or leave blank to skip:`);
+    if (!resp) return;
+    const idx = parseInt(resp, 10);
+    if (!isNaN(idx) && idx >= 1 && idx <= entries.length) {
+      const choice = entries[idx - 1];
+      this.room.send('takeover', { targetSessionId: choice.id });
     }
   }
 

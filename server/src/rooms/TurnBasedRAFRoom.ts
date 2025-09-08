@@ -18,6 +18,9 @@ class RAFState extends Schema {
   @type("number") turnRemainingMs: number = 0;
   @type(["number"]) terrainPoints = new ArraySchema<number>(); // flattened [x0,y0,x1,y1,...]
   @type("number") waterline: number = 560;
+  @type({ map: "string" }) playerNames = new MapSchema<string>();
+  @type({ map: "number" }) disconnectedUntil = new MapSchema<number>(); // sessionId -> epoch ms until grace expires
+  @type("string") winnerSessionId: string = "";
 }
 
 type ImpulseMsg = { creatureId: string; fx: number; fy: number };
@@ -32,6 +35,9 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
   private turnEndsAt = 0;
 
   // Input/physics are client-authoritative now; server tracks only state and turn.
+
+  private disconnectGraceMs = 300_000; // 5 minutes
+  private createdOnJoinIds: Map<string, string[]> = new Map();
 
   // World dims
   private width = 800;
@@ -91,6 +97,48 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
       }
     });
 
+    // Allow a newly joined player to take over a disconnected player's slot and creatures
+    this.onMessage("takeover", (client, message: { targetSessionId: string }) => {
+      const target = message?.targetSessionId;
+      if (!target || target === client.sessionId) return;
+      const until = this.state.disconnectedUntil.get(target);
+      if (typeof until !== 'number' || until <= Date.now()) return; // only allow takeover of currently disconnected-within-grace
+
+      // Remove creatures created for the joiner at entry
+      const mine = this.createdOnJoinIds.get(client.sessionId) || [];
+      for (const id of mine) {
+        this.state.creatures.delete(id);
+      }
+      this.createdOnJoinIds.delete(client.sessionId);
+
+      // Transfer creatures from target to client
+      for (const c of this.state.creatures.values()) {
+        if (c.ownerSessionId === target) c.ownerSessionId = client.sessionId;
+      }
+
+      // Replace target with client in turn order
+      const idx = this.joinOrder.indexOf(target);
+      if (idx >= 0) this.joinOrder[idx] = client.sessionId;
+      // Remove any duplicate of client's id elsewhere in joinOrder
+      this.joinOrder = this.joinOrder.filter((sid, i) => i === idx || sid !== client.sessionId);
+
+      // Transfer last-creature index tracking
+      const lastIdx = this.lastCreatureIndexByPlayer.get(target);
+      if (typeof lastIdx === 'number') {
+        this.lastCreatureIndexByPlayer.set(client.sessionId, lastIdx);
+      }
+      this.lastCreatureIndexByPlayer.delete(target);
+
+      // If target was active, hand over control
+      if (this.state.activePlayerSessionId === target) {
+        this.state.activePlayerSessionId = client.sessionId;
+      }
+
+      // Remove target bookkeeping
+      this.state.playerNames.delete(target);
+      this.state.disconnectedUntil.delete(target);
+    });
+
     this.onMessage("kill", (client, { creatureId }: { creatureId: string }) => {
       const c = this.state.creatures.get(creatureId);
       if (!c) return;
@@ -115,10 +163,17 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
     this.setSimulationInterval((dt) => this.fixedTick(dt));
   }
 
-  onJoin(client: Client) {
+  onJoin(client: Client, options: any) {
     if (!this.joinOrder.includes(client.sessionId)) this.joinOrder.push(client.sessionId);
 
     const color = this.colorForOwner(client.sessionId);
+    // Name handling
+    let name: string = (options?.name ?? "").toString().trim();
+    if (!name) name = `Player-${this.generateId(4)}`;
+    // Truncate to reasonable length and strip newlines
+    name = name.replace(/\s+/g, " ").slice(0, 24);
+    this.state.playerNames.set(client.sessionId, name);
+
     for (let i = 0; i < 3; i++) {
       const c = new Creature();
       c.id = this.generateId();
@@ -130,8 +185,9 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
       c.x = startX;
       c.y = startY;
       this.state.creatures.set(c.id, c);
-
-      // No server-side body creation
+      const created = this.createdOnJoinIds.get(client.sessionId) ?? [];
+      created.push(c.id);
+      this.createdOnJoinIds.set(client.sessionId, created);
     }
 
     if (!this.state.activePlayerSessionId) {
@@ -143,16 +199,23 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
   }
 
   onLeave(client: Client) {
-    // remove all creatures owned by this client
-    [...this.state.creatures.values()] // spread to avoid iterating during delete
-      .filter((c) => c.ownerSessionId === client.sessionId)
-      .forEach((c) => {
-        this.state.creatures.delete(c.id);
-        // No server-side physics cleanup needed
-      });
-
     this.joinOrder = this.joinOrder.filter((id) => id !== client.sessionId);
     this.lastCreatureIndexByPlayer.delete(client.sessionId);
+    // mark disconnected with grace period
+    const until = Date.now() + this.disconnectGraceMs;
+    this.state.disconnectedUntil.set(client.sessionId, until);
+    // If exactly two owners remain alive, and one disconnects, declare immediate win to the other.
+    const owners = this.distinctOwnersWithAlive();
+    if (owners.length === 2) {
+      const other = owners.find((id) => id !== client.sessionId);
+      if (other) {
+        this.state.winnerSessionId = other;
+        this.state.activePlayerSessionId = "";
+        this.state.activeCreatureId = "";
+        this.state.turnRemainingMs = 0;
+        return;
+      }
+    }
 
     if (client.sessionId === this.state.activePlayerSessionId) {
       this.advanceTurn();
@@ -166,6 +229,30 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
     this.state.turnRemainingMs = Math.max(0, this.turnEndsAt - now);
     if (this.state.turnRemainingMs === 0 && this.state.activePlayerSessionId) {
       this.advanceTurn();
+    }
+
+    // Skip turn immediately if the active player is disconnected (in grace)
+    const active = this.state.activePlayerSessionId;
+    if (active && this.isDisconnected(active)) {
+      this.advanceTurn();
+    }
+
+    // Expire disconnected players past grace: remove them and their creatures
+    const expired: string[] = [];
+    for (const [sid, until] of this.state.disconnectedUntil) {
+      if (now >= until) expired.push(sid);
+    }
+    for (const sid of expired) {
+      // remove creatures
+      [...this.state.creatures.values()].forEach((c) => {
+        if (c.ownerSessionId === sid) this.state.creatures.delete(c.id);
+      });
+      // remove bookkeeping
+      this.joinOrder = this.joinOrder.filter((id) => id !== sid);
+      this.lastCreatureIndexByPlayer.delete(sid);
+      this.state.playerNames.delete(sid);
+      this.state.disconnectedUntil.delete(sid);
+      if (sid === this.state.activePlayerSessionId) this.advanceTurn();
     }
   }
 
@@ -183,11 +270,20 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
 
     // move to next player in join order who has alive creatures
     const currentIdx = Math.max(0, playersWithAlive.indexOf(this.state.activePlayerSessionId));
-    const nextPlayer = playersWithAlive[(currentIdx + 1) % playersWithAlive.length];
-    this.state.activePlayerSessionId = nextPlayer;
-    this.pickNextCreatureForPlayer(nextPlayer);
-    this.turnEndsAt = Date.now() + this.turnDurationMs;
-    this.state.turnRemainingMs = this.turnDurationMs;
+    for (let step = 1; step <= playersWithAlive.length; step++) {
+      const cand = playersWithAlive[(currentIdx + step) % playersWithAlive.length];
+      if (!this.isDisconnected(cand)) {
+        this.state.activePlayerSessionId = cand;
+        this.pickNextCreatureForPlayer(cand);
+        this.turnEndsAt = Date.now() + this.turnDurationMs;
+        this.state.turnRemainingMs = this.turnDurationMs;
+        return;
+      }
+    }
+    // No connected players with alive creatures
+    this.state.activePlayerSessionId = "";
+    this.state.activeCreatureId = "";
+    this.state.turnRemainingMs = 0;
   }
 
   private pickNextCreatureForPlayer(sessionId: string) {
@@ -222,7 +318,9 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
   private checkWinCondition(): boolean {
     const owners = this.distinctOwnersWithAlive();
     if (owners.length <= 1) {
-      this.state.activePlayerSessionId = owners[0] || "";
+      const winner = owners[0] || "";
+      this.state.winnerSessionId = winner;
+      this.state.activePlayerSessionId = "";
       this.state.activeCreatureId = "";
       this.state.turnRemainingMs = 0;
       return true;
@@ -274,4 +372,10 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
   private buildTerrainCollision(pts: { x: number; y: number }[]) {
     // Server doesn't build collisions; only clients need this.
   }
+
+  private isDisconnected(sessionId: string): boolean {
+    const until = this.state.disconnectedUntil.get(sessionId);
+    return typeof until === 'number' && until > Date.now();
+  }
+
 }

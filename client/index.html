@@ -15,6 +15,20 @@
         z-index: 10000; /* ensure above Phaser canvas */
         pointer-events: none; /* allow clicks to pass through */
       }
+      #winner {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        color: #ffffff;
+        font-family: Arial, sans-serif;
+        font-size: 42px;
+        font-weight: bold;
+        text-shadow: 0 2px 8px rgba(0,0,0,0.6);
+        z-index: 10001;
+        pointer-events: none;
+        display: none;
+      }
     </style>
   </head>
   <body>
@@ -22,9 +36,11 @@
       <div id="status">Connecting...</div>
       <div id="turn"></div>
       <div id="timer"></div>
+      <div id="scoreboard" style="margin-top:8px; line-height:1.4"></div>
       <div id="debug" style="margin-top:6px;color:#9aa4b2;font-size:12px;"></div>
       <div>Controls: arrows/WASD to move when it's your turn, Up = jump, Space = end turn</div>
     </div>
+    <div id="winner"></div>
     <script type="module" src="./index.ts"></script>
   </body>
   </html>
