@@ -1,6 +1,6 @@
 import { Room, Client } from "colyseus";
 import { Schema, MapSchema, ArraySchema, type } from "@colyseus/schema";
-import Matter from "matter-js";
+// Server no longer runs physics; active client is authoritative for positions.
 
 class Creature extends Schema {
   @type("string") id: string = "";
@@ -31,12 +31,7 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
   private turnDurationMs = 30_000;
   private turnEndsAt = 0;
 
-  // Physics
-  private engine = Matter.Engine.create({ gravity: { scale: 0.001, y: 1 } });
-  private bodiesById: Map<string, Matter.Body> = new Map();
-  private inputHeld: Map<string, { left: boolean; right: boolean }> = new Map();
-  private pendingJump: Set<string> = new Set();
-  private accumulator = 0; // ms accumulator for fixed sub-stepping
+  // Input/physics are client-authoritative now; server tracks only state and turn.
 
   // World dims
   private width = 800;
@@ -54,21 +49,46 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
     // Debug: log once so we can verify in console
     console.log(`[RAF] terrainPoints length: ${this.state.terrainPoints.length}`);
     this.state.waterline = 560;
-    this.buildTerrainCollision(pts);
+    // No server-side collision; terrain points are for clients only.
 
-    // Input is authoritative; apply on server to active creature
-    this.onMessage("input", (client, message: { left?: boolean; right?: boolean }) => {
+    // Client-authoritative position updates from the active player
+    this.onMessage("activePos", (client, message: { x: number; y: number; creatureId?: string }) => {
       if (client.sessionId !== this.state.activePlayerSessionId) return;
-      const held = this.inputHeld.get(client.sessionId) ?? { left: false, right: false };
-      this.inputHeld.set(client.sessionId, {
-        left: !!message.left,
-        right: !!message.right,
-      });
+      const activeId = this.state.activeCreatureId;
+      if (!activeId) return;
+      if (message.creatureId && message.creatureId !== activeId) return;
+      const c = this.state.creatures.get(activeId);
+      if (!c) return;
+      c.x = message.x;
+      c.y = message.y;
+      // Basic server-side rule: drown check (optional authority)
+      if (c.y > this.state.waterline + 10) {
+        this.state.creatures.delete(activeId);
+        this.advanceTurn();
+      }
     });
 
-    this.onMessage("jump", (client) => {
+    // Client-authoritative world state from active player (all creatures)
+    this.onMessage("worldState", (client, message: { updates: Array<{ id: string; x: number; y: number }> }) => {
       if (client.sessionId !== this.state.activePlayerSessionId) return;
-      this.pendingJump.add(client.sessionId);
+      if (!message || !Array.isArray(message.updates)) return;
+      const toDelete: string[] = [];
+      for (const u of message.updates) {
+        const c = this.state.creatures.get(u.id);
+        if (!c) continue;
+        c.x = u.x;
+        c.y = u.y;
+        if (c.y > this.state.waterline + 10) toDelete.push(u.id);
+      }
+      for (const id of toDelete) {
+        const wasActive = id === this.state.activeCreatureId;
+        this.state.creatures.delete(id);
+        if (wasActive) {
+          this.advanceTurn();
+        } else {
+          this.checkWinCondition();
+        }
+      }
     });
 
     this.onMessage("kill", (client, { creatureId }: { creatureId: string }) => {
@@ -111,9 +131,7 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
       c.y = startY;
       this.state.creatures.set(c.id, c);
 
-      const body = Matter.Bodies.circle(startX, startY, c.radius, { restitution: 0.35, friction: 0.8, frictionAir: 0.02 });
-      this.bodiesById.set(c.id, body);
-      Matter.World.add(this.engine.world, body);
+      // No server-side body creation
     }
 
     if (!this.state.activePlayerSessionId) {
@@ -130,11 +148,7 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
       .filter((c) => c.ownerSessionId === client.sessionId)
       .forEach((c) => {
         this.state.creatures.delete(c.id);
-        const b = this.bodiesById.get(c.id);
-        if (b) {
-          Matter.World.remove(this.engine.world, b);
-          this.bodiesById.delete(c.id);
-        }
+        // No server-side physics cleanup needed
       });
 
     this.joinOrder = this.joinOrder.filter((id) => id !== client.sessionId);
@@ -147,68 +161,11 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
     }
   }
 
-  private fixedTick(deltaTimeMs: number) {
+  private fixedTick(_deltaTimeMs: number) {
     const now = Date.now();
     this.state.turnRemainingMs = Math.max(0, this.turnEndsAt - now);
     if (this.state.turnRemainingMs === 0 && this.state.activePlayerSessionId) {
       this.advanceTurn();
-    }
-
-    // Apply input to active creature
-    const activeOwner = this.state.activePlayerSessionId;
-    const activeId = this.state.activeCreatureId;
-    if (activeOwner && activeId) {
-      const body = this.bodiesById.get(activeId);
-      if (body) {
-        const held = this.inputHeld.get(activeOwner) ?? { left: false, right: false };
-        const forceX = (held.left ? -0.0015 : 0) + (held.right ? 0.0015 : 0);
-        if (forceX !== 0) {
-          Matter.Body.applyForce(body, body.position, { x: forceX, y: 0 });
-        }
-        if (this.pendingJump.has(activeOwner)) {
-          this.pendingJump.delete(activeOwner);
-          Matter.Body.applyForce(body, body.position, { x: 0, y: -0.03 });
-        }
-      }
-    }
-
-    // Sub-step to reduce tunneling
-    const step = 16; // ~60Hz
-    this.accumulator += Math.min(deltaTimeMs, 50);
-    let steps = 0;
-    while (this.accumulator >= step && steps < 5) {
-      Matter.Engine.update(this.engine, step);
-      this.accumulator -= step;
-      steps++;
-    }
-
-    // Sync physics -> state, check drown (waterline)
-    const toDelete: string[] = [];
-    for (const [id, body] of this.bodiesById) {
-      const c = this.state.creatures.get(id);
-      if (!c) continue;
-      c.x = body.position.x;
-      c.y = body.position.y;
-
-      if (c.y > this.state.waterline + 10) {
-        toDelete.push(id);
-      }
-    }
-    for (const id of toDelete) {
-      const c = this.state.creatures.get(id);
-      if (c) {
-        this.state.creatures.delete(id);
-        const b = this.bodiesById.get(id);
-        if (b) {
-          Matter.World.remove(this.engine.world, b);
-          this.bodiesById.delete(id);
-        }
-        if (this.state.activeCreatureId === id) {
-          this.advanceTurn();
-        } else {
-          this.checkWinCondition();
-        }
-      }
     }
   }
 
@@ -315,27 +272,6 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
   }
 
   private buildTerrainCollision(pts: { x: number; y: number }[]) {
-    // Build a chain of static thin rectangles along the top surface for collision
-    const parts: Matter.Body[] = [];
-    const thickness = 20;
-    for (let i = 1; i < pts.length; i++) {
-      const a = pts[i - 1];
-      const b = pts[i];
-      const dx = b.x - a.x;
-      const dy = b.y - a.y;
-      const len = Math.hypot(dx, dy) || 1;
-      const angle = Math.atan2(dy, dx);
-      const cx = (a.x + b.x) / 2;
-      const cy = (a.y + b.y) / 2;
-      // Offset the segment so that its top edge aligns with the surface line
-      let nx = -dy / len;
-      let ny = dx / len; // perpendicular to the segment
-      if (ny < 0) { nx = -nx; ny = -ny; } // ensure normal points downward (into the land)
-      const offX = nx * (thickness / 2);
-      const offY = ny * (thickness / 2);
-      const seg = Matter.Bodies.rectangle(cx + offX, cy + offY, len, thickness, { isStatic: true, angle, friction: 0.9, restitution: 0.1 });
-      parts.push(seg);
-    }
-    Matter.World.add(this.engine.world, parts);
+    // Server doesn't build collisions; only clients need this.
   }
 }

@@ -25,6 +25,7 @@ class GameScene extends Phaser.Scene {
   private lastAutoResyncAt: Record<string, number> = {};
   private localActiveId: string | null = null;
   private lastSent = 0;
+  private lastStateSent = 0;
 
   private width = 800;
   private height = 600;
@@ -100,6 +101,14 @@ class GameScene extends Phaser.Scene {
         this.dragLast.set(p.x, p.y);
       }
     });
+
+    // Tweak Matter.js solver for snappier collisions
+    const engine: any = (this.matter.world as any).engine;
+    if (engine) {
+      engine.positionIterations = 8;
+      engine.velocityIterations = 8;
+      engine.constraintIterations = 2;
+    }
   }
 
   update(time: number, delta: number) {
@@ -130,25 +139,27 @@ class GameScene extends Phaser.Scene {
           gfx = this.add.circle(c.x, c.y, c.radius, Number(c.color.replace("#", "0x"))).setDepth(3);
           this.creatureGraphics[id] = gfx;
         }
-        // Ensure physics proxy for non-local-active creatures to enable collisions client-side
-        const isLocalActive = (this.room.sessionId === (stateAny).activePlayerSessionId) && (id === activeId);
-        if (!isLocalActive) {
-          const MatterBody = (Phaser.Physics.Matter as any).Matter.Body;
-          let pbody = this.creatureBodies[id];
-          if (!pbody) {
-            pbody = this.matter.add.circle(c.x, c.y, c.radius, { isStatic: true, friction: 0.8, restitution: 0.35 });
-            this.creatureBodies[id] = pbody;
-          } else if (pbody.isStatic) {
-            MatterBody.setPosition(pbody, { x: c.x, y: c.y });
+        // Active client simulates whole world; others smooth to server
+        const isMyTurnNow = this.room.sessionId === (stateAny).activePlayerSessionId;
+        if (isMyTurnNow) {
+          let body = this.creatureBodies[id];
+          if (!body) {
+            body = this.matter.add.circle(c.x, c.y, c.radius, {
+              restitution: 0.9, // bouncy collisions between creatures
+              friction: 0.05,
+              frictionStatic: 0.05,
+              frictionAir: 0.005,
+              // density: 0.001, // default is fine; equal sizes -> fair energy exchange
+            });
+            this.creatureBodies[id] = body;
           }
-        }
-        // For our locally simulated active creature, render from local physics body.
-        // Otherwise, smooth towards server state for remote creatures.
-        if (this.localActiveId === id && this.creatureBodies[id]) {
-          const body = this.creatureBodies[id];
           gfx.x = body.position.x;
           gfx.y = body.position.y;
         } else {
+          if (this.creatureBodies[id]) {
+            try { this.matter.world.remove(this.creatureBodies[id]); } catch {}
+            delete this.creatureBodies[id];
+          }
           const baseAlpha = 1 - Math.exp(-delta / this.posSmoothingTau);
           const dx = c.x - gfx.x;
           const dy = c.y - gfx.y;
@@ -158,45 +169,15 @@ class GameScene extends Phaser.Scene {
           gfx.y += dy * alphaY;
         }
 
-        // Track last seen server pos to detect server patches and resync locally if diverged
-        const prev = this.lastServerPos[id];
-        const prevT = this.lastServerTime[id] ?? 0;
-        const nowT = Date.now();
-        const changed = !prev || prev.x !== c.x || prev.y !== c.y;
-        if (changed) {
-          // If this is our locally simulated active creature, optionally resync if far off
-          if (this.localActiveId === id && this.creatureBodies[id]) {
-            const body = this.creatureBodies[id];
-            const dx2 = body.position.x - c.x;
-            const dy2 = body.position.y - c.y;
-            const dist = Math.hypot(dx2, dy2);
-            if (dist > this.resyncThreshold) {
-              const lastAt = this.lastAutoResyncAt[id] ?? 0;
-              const canResync = (nowT - lastAt) >= this.autoResyncIntervalMs;
-              if (canResync) {
-                const MatterBody = (Phaser.Physics.Matter as any).Matter.Body;
-                MatterBody.setPosition(body, { x: c.x, y: c.y });
-                // Apply scaled server-estimated velocity on snap
-                const dtSnap = (nowT - prevT) / 1000;
-                if (prev && dtSnap > 0.0001) {
-                  const srvVx = (c.x - prev.x) / dtSnap;
-                  const srvVy = (c.y - prev.y) / dtSnap;
-                  MatterBody.setVelocity(body, { x: srvVx * this.velocityScale, y: srvVy * this.velocityScale });
-                }
-                this.lastAutoResyncAt[id] = nowT;
-              }
-            }
-            // Even when not snapping, nudge velocity towards scaled server-estimated velocity
-            const dt = (nowT - prevT) / 1000;
-            if (prev && dt > 0.0001) {
-              const srvVx = (c.x - prev.x) / dt;
-              const srvVy = (c.y - prev.y) / dt;
-              const MatterBody = (Phaser.Physics.Matter as any).Matter.Body;
-              MatterBody.setVelocity(body, { x: srvVx * this.velocityScale, y: srvVy * this.velocityScale });
-            }
+        // Track server patches only for non-active clients (bookkeeping)
+        if (!(this.room.sessionId === (stateAny).activePlayerSessionId)) {
+          const prev = this.lastServerPos[id];
+          const nowT = Date.now();
+          const changed = !prev || prev.x !== c.x || prev.y !== c.y;
+          if (changed) {
+            this.lastServerPos[id] = { x: c.x, y: c.y };
+            this.lastServerTime[id] = nowT;
           }
-          this.lastServerPos[id] = { x: c.x, y: c.y };
-          this.lastServerTime[id] = nowT;
         }
       });
     }
@@ -217,21 +198,21 @@ class GameScene extends Phaser.Scene {
     // Control only on our active creature
     const isMyTurn = this.room.sessionId === (stateAny).activePlayerSessionId;
     const activeId = (stateAny).activeCreatureId as string;
-    // Ensure local physics body exists only when it's our turn and we have an active creature
-    this.ensureActivePhysics(isMyTurn ? activeId : null);
+    // When not my turn, ensure no leftover physics bodies remain
+    if (!isMyTurn) {
+      for (const id of Object.keys(this.creatureBodies)) {
+        try { this.matter.world.remove(this.creatureBodies[id]); } catch {}
+        delete this.creatureBodies[id];
+      }
+    }
     if (isMyTurn && activeId) {
       const left = this.cursors.left.isDown || this.wasd.left.isDown;
       const right = this.cursors.right.isDown || this.wasd.right.isDown;
-      if (time - this.lastSent > 50) {
-        this.room.send("input", { left, right });
-        this.lastSent = time;
-      }
       if (Phaser.Input.Keyboard.JustDown(this.space)) {
         this.room.send("endTurn");
       }
       if (Phaser.Input.Keyboard.JustDown(this.cursors.up) || Phaser.Input.Keyboard.JustDown(this.wasd.up)) {
-        this.room.send("jump");
-        // Immediate local responsiveness
+        // Immediate local jump only (no server message)
         const body = this.creatureBodies[activeId];
         if (body) {
           const MatterBody = (Phaser.Physics.Matter as any).Matter.Body;
@@ -246,6 +227,16 @@ class GameScene extends Phaser.Scene {
         if (forceX !== 0) {
           MatterBody.applyForce(body, body.position, { x: forceX, y: 0 });
         }
+        // Sending world state happens just after force application (outside this block)
+      }
+      // Send authoritative world state to server at ~20Hz (all creatures)
+      if (time - this.lastStateSent > 50) {
+        const updates: { id: string; x: number; y: number }[] = [];
+        for (const [cid, b] of Object.entries(this.creatureBodies)) {
+          updates.push({ id: cid, x: (b as any).position.x, y: (b as any).position.y });
+        }
+        if (updates.length > 0) this.room.send("worldState", { updates });
+        this.lastStateSent = time;
       }
     }
 
@@ -438,38 +429,7 @@ class GameScene extends Phaser.Scene {
     }
   }
 
-  // Manage local active creature physics body on client
-  private ensureActivePhysics(activeId: string | null) {
-    if (activeId === this.localActiveId) return;
-
-    // Remove previous local active body
-    if (this.localActiveId && this.creatureBodies[this.localActiveId]) {
-      const old = this.creatureBodies[this.localActiveId];
-      try { this.matter.world.remove(old); } catch {}
-      delete this.creatureBodies[this.localActiveId];
-    }
-
-    this.localActiveId = activeId;
-    if (!activeId) return;
-
-    // Remove any existing proxy body for the new active id
-    if (this.creatureBodies[activeId]) {
-      try { this.matter.world.remove(this.creatureBodies[activeId]); } catch {}
-      delete this.creatureBodies[activeId];
-    }
-
-    // Seed new body from server position
-    const stateAny = this.room.state as any;
-    const cm: any = stateAny?.creatures;
-    const c: Creature | undefined = cm?.get?.(activeId) ?? cm?.[activeId];
-    if (!c) return;
-    const body = this.matter.add.circle(c.x, c.y, c.radius, {
-      restitution: 0.35,
-      friction: 0.8,
-      frictionAir: 0.02,
-    });
-    this.creatureBodies[activeId] = body;
-  }
+  // (no per-creature ensure method; active client manages bodies for all creatures)
 }
 
 const config: Phaser.Types.Core.GameConfig = {
