@@ -33,7 +33,7 @@ class GameScene extends Phaser.Scene {
   private lastAutoResyncAt: Record<string, number> = {};
   private localActiveId: string | null = null;
   private lastSent = 0;
-  private lastStateSent = 0;
+  private jumpHeldPrev = false;
 
   private width = 800;
   private height = 600;
@@ -56,6 +56,7 @@ class GameScene extends Phaser.Scene {
   private velocityScale = 0.02; // scale server-estimated velocity for local client feel
   private explosionRadius = 160;
   private explosionForce = 0.12; // stronger blast so creatures visibly fly
+  private spriteLerpTau = 16; // ms time-constant for visual-only smoothing (5x faster)
 
   constructor() {
     super("game");
@@ -129,6 +130,61 @@ class GameScene extends Phaser.Scene {
       engine.constraintIterations = 2;
     }
 
+    // Listen for server snapshots (positions + velocities)
+    this.room.onMessage("snapshot", (msg: any) => {
+      const objs: Array<{ id: string; x: number; y: number; vx: number; vy: number; type: string }> = msg?.objects || [];
+      const MatterBody = (Phaser.Physics.Matter as any).Matter.Body;
+      const nowT = Date.now();
+      for (const o of objs) {
+        const stateAny: any = this.room?.state as any;
+        if (o.type === 'creature') {
+          // ensure creature body exists
+          const pool: any = stateAny?.creatures || {};
+          const getC = typeof pool.get === 'function' ? pool.get.bind(pool) : (id: string) => pool[id];
+          const c = getC(o.id) as Creature | undefined;
+          if (!c) continue;
+          let body = this.creatureBodies[o.id];
+          if (!body) {
+            body = this.matter.add.circle(c.x, c.y, c.radius, {
+              restitution: 0.9,
+              friction: 0.05,
+              frictionAir: 0.02,
+              density: 0.001,
+            });
+            (body as any).__ent = { type: 'creature', id: o.id };
+            this.creatureBodies[o.id] = body;
+          }
+          // direct snap to authoritative state (no smoothing)
+          MatterBody.setPosition(body, { x: o.x, y: o.y });
+          MatterBody.setVelocity(body, { x: o.vx, y: o.vy });
+          // record last server position/time
+          this.lastServerPos[o.id] = { x: o.x, y: o.y };
+          this.lastServerTime[o.id] = nowT;
+        } else if (o.type === 'crate') {
+          // ensure crate body exists
+          const cratesAny: any = stateAny?.crates || {};
+          const getCr = typeof cratesAny.get === 'function' ? cratesAny.get.bind(cratesAny) : (id: string) => cratesAny[id];
+          const cr = getCr(o.id) as Crate | undefined;
+          if (!cr) continue;
+          let body = this.crateBodies[o.id];
+          if (!body) {
+            body = this.matter.add.rectangle(cr.x, cr.y, 14, 14, {
+              restitution: 0.2,
+              friction: 0.6,
+              frictionStatic: 0.8,
+              frictionAir: 0.01,
+            });
+            (body as any).__ent = { type: 'crate', id: o.id };
+            this.crateBodies[o.id] = body;
+          }
+          // direct snap to authoritative state
+          MatterBody.setPosition(body, { x: o.x, y: o.y });
+          MatterBody.setVelocity(body, { x: o.vx, y: o.vy });
+          // visual sprite blends toward body in update()
+        }
+      }
+    });
+
     // Global collision handler for crate pickup
     (this.matter.world as any).on('collisionstart', (event: any) => {
       const pairs = event.pairs || [];
@@ -190,47 +246,24 @@ class GameScene extends Phaser.Scene {
           gfx = this.add.circle(c.x, c.y, c.radius, Number(c.color.replace("#", "0x"))).setDepth(3);
           this.creatureGraphics[id] = gfx;
         }
-        // Active client simulates whole world; others smooth to server
-        const isMyTurnNow = this.room.sessionId === (stateAny).activePlayerSessionId;
-        if (isMyTurnNow) {
-          let body = this.creatureBodies[id];
-          if (!body) {
-            body = this.matter.add.circle(c.x, c.y, c.radius, {
-              restitution: 0.9, // bouncy collisions between creatures
-              friction: 0.05,
-              frictionStatic: 0.05,
-              frictionAir: 0.005,
-              // density: 0.001, // default is fine; equal sizes -> fair energy exchange
-            });
-            (body as any).__ent = { type: 'creature', id };
-            this.creatureBodies[id] = body;
-          }
-          gfx.x = body.position.x;
-          gfx.y = body.position.y;
-        } else {
-          if (this.creatureBodies[id]) {
-            try { this.matter.world.remove(this.creatureBodies[id]); } catch {}
-            delete this.creatureBodies[id];
-          }
-          const baseAlpha = 1 - Math.exp(-delta / this.posSmoothingTau);
-          const dx = c.x - gfx.x;
-          const dy = c.y - gfx.y;
-          const fastYAlpha = 1 - Math.exp(-delta / 50);
-          const alphaY = dy > 0 ? Math.max(baseAlpha, fastYAlpha) : baseAlpha;
-          gfx.x += dx * baseAlpha;
-          gfx.y += dy * alphaY;
+        // Ensure local physics body exists on all clients and use it to drive visuals
+        let body = this.creatureBodies[id];
+        if (!body) {
+          body = this.matter.add.circle(c.x, c.y, c.radius, {
+            restitution: 0.9,
+            friction: 0.05,
+            frictionAir: 0.02,
+            density: 0.001,
+          });
+          (body as any).__ent = { type: 'creature', id };
+          this.creatureBodies[id] = body;
         }
+        // Visual smoothing towards authoritative body position
+        const alpha = 1 - Math.exp(-delta / Math.max(1, this.spriteLerpTau));
+        gfx.x += (body.position.x - gfx.x) * alpha;
+        gfx.y += (body.position.y - gfx.y) * alpha;
 
-        // Track server patches only for non-active clients (bookkeeping)
-        if (!(this.room.sessionId === (stateAny).activePlayerSessionId)) {
-          const prev = this.lastServerPos[id];
-          const nowT = Date.now();
-          const changed = !prev || prev.x !== c.x || prev.y !== c.y;
-          if (changed) {
-            this.lastServerPos[id] = { x: c.x, y: c.y };
-            this.lastServerTime[id] = nowT;
-          }
-        }
+        // Bookkeeping can be simplified now that server is authoritative via snapshots
       });
     }
 
@@ -241,37 +274,30 @@ class GameScene extends Phaser.Scene {
       const forEachCrate = typeof crates.forEach === 'function'
         ? crates.forEach.bind(crates)
         : (cb: Function) => Object.keys(crates).forEach((id) => cb(crates[id], id));
-      const isMyTurnNow = this.room.sessionId === (stateAny).activePlayerSessionId;
       forEachCrate((cr: Crate, id: string) => {
         seenCrates.add(id);
+        // ensure gfx exists
         let gfx = this.crateGraphics[id];
         if (!gfx) {
           gfx = this.add.rectangle(cr.x, cr.y, 14, 14, 0xffe066).setStrokeStyle(2, 0x8d6e00).setDepth(2);
           this.crateGraphics[id] = gfx;
         }
-        if (isMyTurnNow) {
-          let body = this.crateBodies[id];
-          if (!body) {
-            body = this.matter.add.rectangle(cr.x, cr.y, 14, 14, {
-              restitution: 0.2,
-              friction: 0.6,
-              frictionStatic: 0.8,
-              frictionAir: 0.01,
-            });
-            (body as any).__ent = { type: 'crate', id };
-            this.crateBodies[id] = body;
-          }
-          gfx.x = body.position.x;
-          gfx.y = body.position.y;
-        } else {
-          if (this.crateBodies[id]) {
-            try { this.matter.world.remove(this.crateBodies[id]); } catch {}
-            delete this.crateBodies[id];
-          }
-          // Follow server position (updated by active player)
-          gfx.x = (cr as any).x;
-          gfx.y = (cr as any).y;
+        // ensure body exists (may be created from snapshot; if not, create at state pos)
+        let body = this.crateBodies[id];
+        if (!body) {
+          body = this.matter.add.rectangle(cr.x, cr.y, 14, 14, {
+            restitution: 0.2,
+            friction: 0.6,
+            frictionStatic: 0.8,
+            frictionAir: 0.01,
+          });
+          (body as any).__ent = { type: 'crate', id };
+          this.crateBodies[id] = body;
         }
+        // Visual smoothing towards body position
+        const alpha = 1 - Math.exp(-delta / Math.max(1, this.spriteLerpTau));
+        gfx.x += ((body as any).position.x - gfx.x) * alpha;
+        gfx.y += ((body as any).position.y - gfx.y) * alpha;
       });
     }
     // Cleanup crates removed from state
@@ -299,80 +325,78 @@ class GameScene extends Phaser.Scene {
       }
     });
 
-    // Control only on our active creature
+    // Control only on our active creature; send inputs to server at 20Hz and predict locally
     const isMyTurn = this.room.sessionId === (stateAny).activePlayerSessionId;
     const activeId = (stateAny).activeCreatureId as string;
-    // When not my turn, ensure no leftover physics bodies remain
-    if (!isMyTurn) {
-      for (const id of Object.keys(this.creatureBodies)) {
-        try { this.matter.world.remove(this.creatureBodies[id]); } catch {}
-        delete this.creatureBodies[id];
-      }
-    }
     if (isMyTurn && activeId) {
       const left = this.cursors.left.isDown || this.wasd.left.isDown;
       const right = this.cursors.right.isDown || this.wasd.right.isDown;
+      const upNow = this.cursors.up.isDown || this.wasd.up.isDown;
+      const justJump = upNow && !this.jumpHeldPrev;
+      this.jumpHeldPrev = upNow;
+
       if (!this.grenade && Phaser.Input.Keyboard.JustDown(this.space)) {
         this.room.send("endTurn");
       }
 
-      // Weapon fire: Enter to drop grenade
+      // Discrete Enter: use current weapon (e.g., drop grenade)
       if (Phaser.Input.Keyboard.JustDown(this.keyEnter)) {
-        const myWeapon = this.getWeaponForMe();
-        if (myWeapon === 'grenade' && !this.grenade) {
-          const body = this.creatureBodies[activeId];
-          if (body) {
-            const gx = body.position.x;
-            const gy = body.position.y - 18; // drop slightly above
-            const gBody = this.matter.add.circle(gx, gy, 6, {
-              restitution: 0.6, // bouncy
-              friction: 0.2,    // rolls a bit
-              frictionAir: 0.01,
-              // density: default
+        const weapon = this.getWeaponForMe();
+        if (!this.grenade && weapon === 'grenade') {
+          // Spawn a simple grenade body positioned beneath the creature to avoid overlap ejection
+          const activeBody = this.creatureBodies[activeId];
+          if (activeBody) {
+            // Determine a spawn point outside the creature radius, directly beneath
+            const stateAny2: any = this.room?.state as any;
+            const pool: any = stateAny2?.creatures || {};
+            const getC = typeof pool.get === 'function' ? pool.get.bind(pool) : (id: string) => pool[id];
+            const c: any = getC(activeId) || {};
+            const rCreature = Number(c.radius) || 16;
+            const rGrenade = 6;
+            const margin = 4;
+            const dist = rCreature + rGrenade + margin;
+            const baseX = (activeBody as any).position.x;
+            const baseY = (activeBody as any).position.y;
+            const px = baseX;
+            const py = baseY + dist; // below the creature
+
+            const body = this.matter.add.circle(px, py, rGrenade, {
+              restitution: 0.3,
+              friction: 0.3,
+              frictionAir: 0.005,
+              density: 0.0008,
             });
-            (gBody as any).__ent = { type: 'grenade', id: 'grenade' };
-            const gfx = this.add.circle(gx, gy, 6, 0xcccccc).setStrokeStyle(2, 0x333333).setDepth(3);
-            this.grenade = { id: 'grenade', body: gBody, gfx, explodeAt: Date.now() + 5000 };
-            // consume weapon server-side
+            const gfx = this.add.circle(px, py, rGrenade, 0x888888).setDepth(3);
+            // No initial upward impulse; let gravity settle it. Minimal horizontal carry-over from creature.
+            const MatterBody = (Phaser.Physics.Matter as any).Matter.Body;
+            const carryVx = (activeBody as any).velocity?.x ?? 0;
+            MatterBody.setVelocity(body, { x: carryVx * 0.25, y: 0 });
+            this.grenade = { id: 'gren', body, gfx, explodeAt: Date.now() + 2000 };
+            // Inform server we consumed weapon -> triggers retreat timer
             this.room.send('consumeWeapon');
           }
         }
       }
-      if (Phaser.Input.Keyboard.JustDown(this.cursors.up) || Phaser.Input.Keyboard.JustDown(this.wasd.up)) {
-        // Immediate local jump only (no server message)
-        const body = this.creatureBodies[activeId];
-        if (body) {
-          const MatterBody = (Phaser.Physics.Matter as any).Matter.Body;
-          MatterBody.applyForce(body, body.position, { x: 0, y: -0.03 });
-        }
+
+      // Edge-triggered actions: send immediately to avoid being dropped by 20Hz sampler
+      if (justJump) {
+        this.room.send("jump");
       }
-      // Apply held forces locally for responsiveness
+
+      // Local prediction: apply forces to the active creature body
       const body = this.creatureBodies[activeId];
       if (body) {
         const MatterBody = (Phaser.Physics.Matter as any).Matter.Body;
         const forceX = (left ? -0.0015 : 0) + (right ? 0.0015 : 0);
-        if (forceX !== 0) {
-          MatterBody.applyForce(body, body.position, { x: forceX, y: 0 });
-        }
-        // Sending world state happens just after force application (outside this block)
+        if (forceX !== 0) MatterBody.applyForce(body, body.position, { x: forceX, y: 0 });
+        if (justJump) MatterBody.applyForce(body, body.position, { x: 0, y: -0.03 });
       }
-      // Send authoritative world state to server at ~20Hz (all creatures)
-      if (time - this.lastStateSent > 50) {
-        const updates: { id: string; x: number; y: number }[] = [];
-        for (const [cid, b] of Object.entries(this.creatureBodies)) {
-          updates.push({ id: cid, x: (b as any).position.x, y: (b as any).position.y });
-        }
-        if (updates.length > 0) this.room.send("worldState", { updates });
-        // Also push crate positions (authoritative while it's our turn)
-        const crateUpdates: { id: string; x: number; y: number }[] = [];
-        for (const [id, b] of Object.entries(this.crateBodies)) {
-          if (!b) continue;
-          crateUpdates.push({ id, x: (b as any).position.x, y: (b as any).position.y });
-          const gfx = this.crateGraphics[id];
-          if (gfx) { gfx.x = (b as any).position.x; gfx.y = (b as any).position.y; }
-        }
-        if (crateUpdates.length > 0) this.room.send('crateState', { updates: crateUpdates });
-        this.lastStateSent = time;
+
+      // Sample and send inputs just before snapshot cadence (~20Hz)
+      if (time - this.lastSent >= 50) {
+        // Only continuous axes here; discrete jump is sent immediately
+        this.room.send("input", { left, right });
+        this.lastSent = time;
       }
     }
 

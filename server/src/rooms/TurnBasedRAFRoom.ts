@@ -1,6 +1,7 @@
 import { Room, Client } from "colyseus";
 import { Schema, MapSchema, ArraySchema, type } from "@colyseus/schema";
-// Server no longer runs physics; active client is authoritative for positions.
+import Matter from "matter-js";
+// Server authoritative physics using Matter.js. Clients send inputs; server simulates and broadcasts snapshots.
 
 class Creature extends Schema {
   @type("string") id: string = "";
@@ -47,7 +48,18 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
   private turnDurationMs = 30_000;
   private turnEndsAt = 0;
 
-  // Input/physics are client-authoritative now; server tracks only state and turn.
+  // Matter.js physics
+  private engine = Matter.Engine.create();
+  private world = this.engine.world;
+  private creatureBodies: Map<string, Matter.Body> = new Map();
+  private crateBodies: Map<string, Matter.Body> = new Map();
+  private terrainBodies: Matter.Body[] = [];
+  private snapshotIntervalMs = 50; // 20Hz snapshots
+  private lastSnapshotAt = 0;
+
+  // Latest input from active player
+  private latestInput: { left?: boolean; right?: boolean; jump?: boolean } = {};
+  private jumpQueued: boolean = false;
 
   private disconnectGraceMs = 300_000; // 5 minutes
   private createdOnJoinIds: Map<string, string[]> = new Map();
@@ -68,60 +80,28 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
     // Debug: log once so we can verify in console
     console.log(`[RAF] terrainPoints length: ${this.state.terrainPoints.length}`);
     this.state.waterline = 560;
-    // No server-side collision; terrain points are for clients only.
+    // Build server-side terrain collisions
+    const pairs: { x: number; y: number }[] = [];
+    for (let i = 0; i < this.state.terrainPoints.length - 1; i += 2) {
+      pairs.push({ x: this.state.terrainPoints[i], y: this.state.terrainPoints[i + 1] });
+    }
+    this.buildTerrainCollision(pairs);
 
-    // Client-authoritative position updates from the active player
-    this.onMessage("activePos", (client, message: { x: number; y: number; creatureId?: string }) => {
+    // Input from active player (20Hz from client) — continuous axes only
+    this.onMessage("input", (client, message: { left?: boolean; right?: boolean; jump?: boolean }) => {
       if (client.sessionId !== this.state.activePlayerSessionId) return;
-      const activeId = this.state.activeCreatureId;
-      if (!activeId) return;
-      if (message.creatureId && message.creatureId !== activeId) return;
-      const c = this.state.creatures.get(activeId);
-      if (!c) return;
-      c.x = message.x;
-      c.y = message.y;
-      // Basic server-side rule: drown check (optional authority)
-      if (c.y > this.state.waterline + 10) {
-        this.state.creatures.delete(activeId);
-        this.advanceTurn();
-      }
+      this.latestInput = {
+        left: !!message?.left,
+        right: !!message?.right,
+        // jump is handled via a discrete message; ignore here to avoid edge-loss
+        jump: false,
+      };
     });
 
-    
-
-    // Client-authoritative world state from active player (all creatures)
-    this.onMessage("worldState", (client, message: { updates: Array<{ id: string; x: number; y: number }> }) => {
+    // Discrete jump action from active player (edge-triggered)
+    this.onMessage("jump", (client) => {
       if (client.sessionId !== this.state.activePlayerSessionId) return;
-      if (!message || !Array.isArray(message.updates)) return;
-      const toDelete: string[] = [];
-      for (const u of message.updates) {
-        const c = this.state.creatures.get(u.id);
-        if (!c) continue;
-        c.x = u.x;
-        c.y = u.y;
-        if (c.y > this.state.waterline + 10) toDelete.push(u.id);
-      }
-      for (const id of toDelete) {
-        const wasActive = id === this.state.activeCreatureId;
-        this.state.creatures.delete(id);
-        if (wasActive) {
-          this.advanceTurn();
-        } else {
-          this.checkWinCondition();
-        }
-      }
-    });
-
-    // Active client updates crate positions (authoritative for crate physics)
-    this.onMessage("crateState", (client, message: { updates: Array<{ id: string; x: number; y: number }> }) => {
-      if (client.sessionId !== this.state.activePlayerSessionId) return;
-      if (!message || !Array.isArray(message.updates)) return;
-      for (const u of message.updates) {
-        const crate = this.state.crates.get(u.id);
-        if (!crate) continue;
-        crate.x = u.x;
-        crate.y = u.y;
-      }
+      this.jumpQueued = true;
     });
 
     // Pickup crate -> grant weapon to that player's team
@@ -134,6 +114,12 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
       // grant weapon (overwrite existing for simplicity)
       this.state.weaponsByPlayer.set(bySessionId, crate.weapon || "grenade");
       this.state.crates.delete(crateId);
+      // remove server physics body for crate
+      const body = this.crateBodies.get(crateId);
+      if (body) {
+        try { Matter.Composite.remove(this.world, body); } catch {}
+        this.crateBodies.delete(crateId);
+      }
     });
 
     // Consume current player's weapon (e.g., when grenade is dropped)
@@ -163,6 +149,7 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
       for (const id of toDelete) {
         const wasActive = id === this.state.activeCreatureId;
         this.state.creatures.delete(id);
+        this.removeCreatureBody(id);
         if (wasActive) {
           this.advanceTurn();
         } else {
@@ -234,6 +221,11 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
       }
     });
 
+    this.world.gravity.y = 1;
+    this.engine.positionIterations = 8;
+    this.engine.velocityIterations = 8;
+    this.engine.constraintIterations = 2;
+
     this.setSimulationInterval((dt) => this.fixedTick(dt));
   }
 
@@ -260,6 +252,7 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
       c.x = startX;
       c.y = startY;
       this.state.creatures.set(c.id, c);
+      this.createCreatureBody(c);
       const created = this.createdOnJoinIds.get(client.sessionId) ?? [];
       created.push(c.id);
       this.createdOnJoinIds.set(client.sessionId, created);
@@ -301,7 +294,7 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
     }
   }
 
-  private fixedTick(_deltaTimeMs: number) {
+  private fixedTick(deltaTimeMs: number) {
     const now = Date.now();
     this.state.turnRemainingMs = Math.max(0, this.turnEndsAt - now);
     if (this.state.turnRemainingMs === 0 && this.state.activePlayerSessionId) {
@@ -323,6 +316,7 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
       // remove creatures
       [...this.state.creatures.values()].forEach((c) => {
         if (c.ownerSessionId === sid) this.state.creatures.delete(c.id);
+        if (c.ownerSessionId === sid) this.removeCreatureBody(c.id);
       });
       // remove bookkeeping
       this.joinOrder = this.joinOrder.filter((id) => id !== sid);
@@ -330,6 +324,59 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
       this.state.playerNames.delete(sid);
       this.state.disconnectedUntil.delete(sid);
       if (sid === this.state.activePlayerSessionId) this.advanceTurn();
+    }
+
+    // Apply latest input forces to active creature
+    const activeId = this.state.activeCreatureId;
+    if (activeId) {
+      const body = this.creatureBodies.get(activeId);
+      if (body) {
+        const forceX = (this.latestInput.left ? -0.0015 : 0) + (this.latestInput.right ? 0.0015 : 0);
+        if (forceX !== 0) {
+          Matter.Body.applyForce(body, body.position, { x: forceX, y: 0 });
+        }
+        // Apply queued jump impulse once
+        if (this.jumpQueued) {
+          Matter.Body.applyForce(body, body.position, { x: 0, y: -0.03 });
+          this.jumpQueued = false;
+        }
+      }
+    }
+
+    // Step physics
+    Matter.Engine.update(this.engine, deltaTimeMs);
+
+    // Mirror physics positions into schema for general visibility
+    for (const [id, body] of this.creatureBodies) {
+      const c = this.state.creatures.get(id);
+      if (!c) continue;
+      c.x = body.position.x;
+      c.y = body.position.y;
+    }
+
+    // Drown check and removals
+    const toDelete: string[] = [];
+    for (const [id, body] of this.creatureBodies) {
+      if (body.position.y > this.state.waterline + 10) toDelete.push(id);
+    }
+    for (const id of toDelete) {
+      const wasActive = id === this.state.activeCreatureId;
+      this.state.creatures.delete(id);
+      this.removeCreatureBody(id);
+      if (wasActive) this.advanceTurn();
+    }
+
+    // Broadcast periodic snapshot (pos + velocity)
+    if (now - this.lastSnapshotAt >= this.snapshotIntervalMs) {
+      const objects: Array<{ id: string; x: number; y: number; vx: number; vy: number; type: string }> = [];
+      for (const [id, body] of this.creatureBodies) {
+        objects.push({ id, x: body.position.x, y: body.position.y, vx: body.velocity.x, vy: body.velocity.y, type: "creature" });
+      }
+      for (const [id, body] of this.crateBodies) {
+        objects.push({ id, x: body.position.x, y: body.position.y, vx: body.velocity.x, vy: body.velocity.y, type: "crate" });
+      }
+      this.broadcast("snapshot", { objects });
+      this.lastSnapshotAt = now;
     }
   }
 
@@ -449,7 +496,53 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
   }
 
   private buildTerrainCollision(pts: { x: number; y: number }[]) {
-    // Server doesn't build collisions; only clients need this.
+    try {
+      // Remove prior terrain bodies
+      for (const b of this.terrainBodies) Matter.Composite.remove(this.world, b);
+      this.terrainBodies = [];
+      if (!pts || pts.length < 2) return;
+      const thickness = 20;
+      for (let i = 1; i < pts.length; i++) {
+        const a = pts[i - 1];
+        const b = pts[i];
+        const dx = b.x - a.x;
+        const dy = b.y - a.y;
+        const len = Math.hypot(dx, dy) || 1;
+        const angle = Math.atan2(dy, dx);
+        let nx = -dy / len;
+        let ny = dx / len;
+        if (ny < 0) { nx = -nx; ny = -ny; }
+        const offX = nx * (thickness / 2);
+        const offY = ny * (thickness / 2);
+        const cx = (a.x + b.x) / 2 + offX;
+        const cy = (a.y + b.y) / 2 + offY;
+        const seg = Matter.Bodies.rectangle(cx, cy, len, thickness, { isStatic: true, angle, friction: 0.9, restitution: 0.1 });
+        this.terrainBodies.push(seg);
+      }
+      Matter.Composite.add(this.world, this.terrainBodies);
+    } catch (e) {
+      console.error("Failed to build terrain bodies:", e);
+    }
+  }
+
+  private createCreatureBody(c: Creature) {
+    const body = Matter.Bodies.circle(c.x, c.y, c.radius, {
+      restitution: 0.9,
+      friction: 0.05,
+      frictionAir: 0.02,
+      density: 0.001,
+    });
+    (body as any).__id = c.id;
+    this.creatureBodies.set(c.id, body);
+    Matter.Composite.add(this.world, body);
+  }
+
+  private removeCreatureBody(id: string) {
+    const body = this.creatureBodies.get(id);
+    if (body) {
+      try { Matter.Composite.remove(this.world, body); } catch {}
+    }
+    this.creatureBodies.delete(id);
   }
 
   private isDisconnected(sessionId: string): boolean {
@@ -458,9 +551,16 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
   }
 
   private spawnCrate() {
-    // Remove any existing crates
+    // Remove any existing crates (state + physics)
     const ids = Array.from(this.state.crates.keys());
-    for (const id of ids) this.state.crates.delete(id);
+    for (const id of ids) {
+      this.state.crates.delete(id);
+      const body = this.crateBodies.get(id);
+      if (body) {
+        try { Matter.Composite.remove(this.world, body); } catch {}
+        this.crateBodies.delete(id);
+      }
+    }
 
     // Pick a random x over dry land (y above waterline)
     const tp = this.state.terrainPoints;
@@ -475,6 +575,17 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
     crate.x = pick.x;
     crate.y = -200;
     this.state.crates.set(crate.id, crate);
+
+    // Create server-side physics body for the crate
+    const body = Matter.Bodies.rectangle(crate.x, crate.y, 14, 14, {
+      restitution: 0.2,
+      friction: 0.6,
+      frictionStatic: 0.8,
+      frictionAir: 0.01,
+    });
+    (body as any).__id = crate.id;
+    this.crateBodies.set(crate.id, body);
+    Matter.Composite.add(this.world, body);
   }
 
 }

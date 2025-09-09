@@ -19,7 +19,8 @@
     "@colyseus/schema": "^3.0.60",
     "colyseus": "^0.16.4",
     "cors": "^2.8.5",
-    "express": "^5.1.0"
+    "express": "^5.1.0",
+    "matter-js": "^0.20.0"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
