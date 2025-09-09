@@ -9,6 +9,15 @@ class Creature extends Schema {
   @type("number") y: number = 0;
   @type("number") radius: number = 16;
   @type("string") color: string = "#2d8cf0";
+  @type("number") hp: number = 100;
+}
+
+class Crate extends Schema {
+  @type("string") id: string = "";
+  @type("number") x: number = 0;
+  @type("number") y: number = -200;
+  // weapon type in this crate (e.g., "grenade")
+  @type("string") weapon: string = "grenade";
 }
 
 class RAFState extends Schema {
@@ -21,6 +30,10 @@ class RAFState extends Schema {
   @type({ map: "string" }) playerNames = new MapSchema<string>();
   @type({ map: "number" }) disconnectedUntil = new MapSchema<number>(); // sessionId -> epoch ms until grace expires
   @type("string") winnerSessionId: string = "";
+  // Active weapon crates in the world
+  @type({ map: Crate }) crates = new MapSchema<Crate>();
+  // Player/team weapons by owner session id (e.g., "grenade" or "")
+  @type({ map: "string" }) weaponsByPlayer = new MapSchema<string>();
 }
 
 type ImpulseMsg = { creatureId: string; fx: number; fy: number };
@@ -74,6 +87,8 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
       }
     });
 
+    
+
     // Client-authoritative world state from active player (all creatures)
     this.onMessage("worldState", (client, message: { updates: Array<{ id: string; x: number; y: number }> }) => {
       if (client.sessionId !== this.state.activePlayerSessionId) return;
@@ -85,6 +100,65 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
         c.x = u.x;
         c.y = u.y;
         if (c.y > this.state.waterline + 10) toDelete.push(u.id);
+      }
+      for (const id of toDelete) {
+        const wasActive = id === this.state.activeCreatureId;
+        this.state.creatures.delete(id);
+        if (wasActive) {
+          this.advanceTurn();
+        } else {
+          this.checkWinCondition();
+        }
+      }
+    });
+
+    // Active client updates crate positions (authoritative for crate physics)
+    this.onMessage("crateState", (client, message: { updates: Array<{ id: string; x: number; y: number }> }) => {
+      if (client.sessionId !== this.state.activePlayerSessionId) return;
+      if (!message || !Array.isArray(message.updates)) return;
+      for (const u of message.updates) {
+        const crate = this.state.crates.get(u.id);
+        if (!crate) continue;
+        crate.x = u.x;
+        crate.y = u.y;
+      }
+    });
+
+    // Pickup crate -> grant weapon to that player's team
+    this.onMessage("pickupCrate", (client, message: { crateId: string; bySessionId: string }) => {
+      if (client.sessionId !== this.state.activePlayerSessionId) return;
+      const { crateId, bySessionId } = message || ({} as any);
+      if (!crateId || !bySessionId) return;
+      const crate = this.state.crates.get(crateId);
+      if (!crate) return;
+      // grant weapon (overwrite existing for simplicity)
+      this.state.weaponsByPlayer.set(bySessionId, crate.weapon || "grenade");
+      this.state.crates.delete(crateId);
+    });
+
+    // Consume current player's weapon (e.g., when grenade is dropped)
+    this.onMessage("consumeWeapon", (client) => {
+      const sid = client.sessionId;
+      const current = this.state.weaponsByPlayer.get(sid);
+      if (!current) return;
+      this.state.weaponsByPlayer.delete(sid);
+      // Enter retreat mode: exactly 5s to retreat from the moment of weapon use
+      const now = Date.now();
+      this.turnEndsAt = now + 5000;
+      this.state.turnRemainingMs = 5000;
+    });
+
+    // Apply damage to creatures (from active client explosion events)
+    this.onMessage("applyDamage", (client, message: { hits: Array<{ id: string; dmg: number }> }) => {
+      if (client.sessionId !== this.state.activePlayerSessionId) return;
+      if (!message || !Array.isArray(message.hits)) return;
+      const toDelete: string[] = [];
+      for (const h of message.hits) {
+        const c = this.state.creatures.get(h.id);
+        if (!c) continue;
+        const dmg = Math.max(0, Math.min(200, Number(h.dmg) || 0));
+        c.hp = Math.max(0, (c.hp ?? 100) - dmg);
+        if (c.hp <= 0) toDelete.push(c.id);
       }
       for (const id of toDelete) {
         const wasActive = id === this.state.activeCreatureId;
@@ -180,6 +254,7 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
       c.ownerSessionId = client.sessionId;
       c.radius = 16;
       c.color = color;
+      c.hp = 100;
       const startX = 100 + Math.random() * (this.width - 200);
       const startY = 200 + Math.random() * 100;
       c.x = startX;
@@ -195,6 +270,8 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
       this.pickNextCreatureForPlayer(client.sessionId);
       this.turnEndsAt = Date.now() + this.turnDurationMs;
       this.state.turnRemainingMs = this.turnDurationMs;
+      // Spawn a weapon crate for the first turn
+      this.spawnCrate();
     }
   }
 
@@ -277,6 +354,8 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
         this.pickNextCreatureForPlayer(cand);
         this.turnEndsAt = Date.now() + this.turnDurationMs;
         this.state.turnRemainingMs = this.turnDurationMs;
+        // New turn -> new crate
+        this.spawnCrate();
         return;
       }
     }
@@ -376,6 +455,26 @@ export class TurnBasedRAFRoom extends Room<RAFState> {
   private isDisconnected(sessionId: string): boolean {
     const until = this.state.disconnectedUntil.get(sessionId);
     return typeof until === 'number' && until > Date.now();
+  }
+
+  private spawnCrate() {
+    // Remove any existing crates
+    const ids = Array.from(this.state.crates.keys());
+    for (const id of ids) this.state.crates.delete(id);
+
+    // Pick a random x over dry land (y above waterline)
+    const tp = this.state.terrainPoints;
+    if (!tp || tp.length < 4) return;
+    const pairs: Array<{ x: number; y: number }> = [];
+    for (let i = 0; i < tp.length - 1; i += 2) pairs.push({ x: tp[i], y: tp[i + 1] });
+    const dry = pairs.filter((p) => p.y < this.state.waterline - 10);
+    const pick = dry.length > 0 ? dry[(Math.random() * dry.length) | 0] : pairs[(Math.random() * pairs.length) | 0];
+    const crate = new Crate();
+    crate.id = `crate_${this.generateId(6)}`;
+    crate.weapon = "grenade";
+    crate.x = pick.x;
+    crate.y = -200;
+    this.state.crates.set(crate.id, crate);
   }
 
 }

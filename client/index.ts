@@ -1,12 +1,16 @@
 import Phaser from "phaser";
 import { Client, Room } from "colyseus.js";
 
-type Creature = { id: string; ownerSessionId: string; x: number; y: number; radius: number; color: string };
+type Creature = { id: string; ownerSessionId: string; x: number; y: number; radius: number; color: string; hp?: number };
+type Crate = { id: string; x: number; y: number; weapon: string };
 type RoomState = {
   creatures: Map<string, Creature> | Record<string, Creature>;
   activePlayerSessionId: string;
   activeCreatureId: string;
   turnRemainingMs: number;
+  waterline?: number;
+  crates?: Map<string, Crate> | Record<string, Crate>;
+  weaponsByPlayer?: Map<string, string> | Record<string, string>;
 };
 
 class GameScene extends Phaser.Scene {
@@ -16,9 +20,13 @@ class GameScene extends Phaser.Scene {
   private cursors!: Phaser.Types.Input.Keyboard.CursorKeys;
   private wasd!: { up: Phaser.Input.Keyboard.Key; down: Phaser.Input.Keyboard.Key; left: Phaser.Input.Keyboard.Key; right: Phaser.Input.Keyboard.Key };
   private space!: Phaser.Input.Keyboard.Key;
+  private keyEnter!: Phaser.Input.Keyboard.Key;
 
   private creatureGraphics: Record<string, Phaser.GameObjects.Arc> = {};
   private creatureBodies: Record<string, any> = {};
+  private crateGraphics: Record<string, Phaser.GameObjects.Rectangle> = {};
+  private crateBodies: Record<string, any> = {};
+  private grenade: { id: string; body?: any; gfx?: Phaser.GameObjects.Arc; explodeAt: number } | null = null;
   private terrainBodies: any[] = [];
   private lastServerPos: Record<string, { x: number; y: number }> = {};
   private lastServerTime: Record<string, number> = {};
@@ -46,6 +54,8 @@ class GameScene extends Phaser.Scene {
   private resyncThreshold = 24; // px divergence before snapping to server
   private autoResyncIntervalMs = 0; // resync as often as server updates
   private velocityScale = 0.02; // scale server-estimated velocity for local client feel
+  private explosionRadius = 160;
+  private explosionForce = 0.12; // stronger blast so creatures visibly fly
 
   constructor() {
     super("game");
@@ -69,6 +79,7 @@ class GameScene extends Phaser.Scene {
       right: this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.D)
     };
     this.space = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.SPACE);
+    this.keyEnter = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.ENTER);
 
     (document.getElementById("status")!).textContent = "Connecting to server...";
     // Ask for player name (store in localStorage)
@@ -117,6 +128,38 @@ class GameScene extends Phaser.Scene {
       engine.velocityIterations = 8;
       engine.constraintIterations = 2;
     }
+
+    // Global collision handler for crate pickup
+    (this.matter.world as any).on('collisionstart', (event: any) => {
+      const pairs = event.pairs || [];
+      for (const p of pairs) {
+        const a = p.bodyA;
+        const b = p.bodyB;
+        const infoA = (a as any).__ent as { type: string; id: string } | undefined;
+        const infoB = (b as any).__ent as { type: string; id: string } | undefined;
+        if (!infoA || !infoB) continue;
+        // crate vs creature -> pickup
+        let crateInfo: any, creatureInfo: any;
+        if (infoA.type === 'crate' && infoB.type === 'creature') { crateInfo = infoA; creatureInfo = infoB; }
+        else if (infoB.type === 'crate' && infoA.type === 'creature') { crateInfo = infoB; creatureInfo = infoA; }
+        if (crateInfo && creatureInfo) {
+          const stateAny: any = this.room?.state as any;
+          const creatures: any = stateAny?.creatures || {};
+          const getC = typeof creatures.get === 'function' ? creatures.get.bind(creatures) : (id: string) => creatures[id];
+          const c = getC(creatureInfo.id) as Creature | undefined;
+          if (!c) continue;
+          // Award to creature owner's team
+          this.room?.send('pickupCrate', { crateId: crateInfo.id, bySessionId: c.ownerSessionId });
+          // Remove crate locally
+          const body = this.crateBodies[crateInfo.id];
+          if (body) { try { this.matter.world.remove(body); } catch {} }
+          this.crateBodies[crateInfo.id] = undefined as any;
+          const gfx = this.crateGraphics[crateInfo.id];
+          if (gfx) gfx.destroy();
+          delete this.crateGraphics[crateInfo.id];
+        }
+      }
+    });
   }
 
   update(time: number, delta: number) {
@@ -159,6 +202,7 @@ class GameScene extends Phaser.Scene {
               frictionAir: 0.005,
               // density: 0.001, // default is fine; equal sizes -> fair energy exchange
             });
+            (body as any).__ent = { type: 'creature', id };
             this.creatureBodies[id] = body;
           }
           gfx.x = body.position.x;
@@ -190,6 +234,58 @@ class GameScene extends Phaser.Scene {
       });
     }
 
+    // Crates
+    const seenCrates = new Set<string>();
+    const crates: any = stateAny?.crates;
+    if (crates) {
+      const forEachCrate = typeof crates.forEach === 'function'
+        ? crates.forEach.bind(crates)
+        : (cb: Function) => Object.keys(crates).forEach((id) => cb(crates[id], id));
+      const isMyTurnNow = this.room.sessionId === (stateAny).activePlayerSessionId;
+      forEachCrate((cr: Crate, id: string) => {
+        seenCrates.add(id);
+        let gfx = this.crateGraphics[id];
+        if (!gfx) {
+          gfx = this.add.rectangle(cr.x, cr.y, 14, 14, 0xffe066).setStrokeStyle(2, 0x8d6e00).setDepth(2);
+          this.crateGraphics[id] = gfx;
+        }
+        if (isMyTurnNow) {
+          let body = this.crateBodies[id];
+          if (!body) {
+            body = this.matter.add.rectangle(cr.x, cr.y, 14, 14, {
+              restitution: 0.2,
+              friction: 0.6,
+              frictionStatic: 0.8,
+              frictionAir: 0.01,
+            });
+            (body as any).__ent = { type: 'crate', id };
+            this.crateBodies[id] = body;
+          }
+          gfx.x = body.position.x;
+          gfx.y = body.position.y;
+        } else {
+          if (this.crateBodies[id]) {
+            try { this.matter.world.remove(this.crateBodies[id]); } catch {}
+            delete this.crateBodies[id];
+          }
+          // Follow server position (updated by active player)
+          gfx.x = (cr as any).x;
+          gfx.y = (cr as any).y;
+        }
+      });
+    }
+    // Cleanup crates removed from state
+    Object.keys(this.crateGraphics).forEach((id) => {
+      if (!seenCrates.has(id)) {
+        this.crateGraphics[id]?.destroy();
+        delete this.crateGraphics[id];
+        if (this.crateBodies[id]) {
+          try { this.matter.world.remove(this.crateBodies[id]); } catch {}
+          delete this.crateBodies[id];
+        }
+      }
+    });
+
     // Remove entities that no longer exist on server
     Object.keys(this.creatureGraphics).forEach((id) => {
       if (!seen.has(id)) {
@@ -216,8 +312,31 @@ class GameScene extends Phaser.Scene {
     if (isMyTurn && activeId) {
       const left = this.cursors.left.isDown || this.wasd.left.isDown;
       const right = this.cursors.right.isDown || this.wasd.right.isDown;
-      if (Phaser.Input.Keyboard.JustDown(this.space)) {
+      if (!this.grenade && Phaser.Input.Keyboard.JustDown(this.space)) {
         this.room.send("endTurn");
+      }
+
+      // Weapon fire: Enter to drop grenade
+      if (Phaser.Input.Keyboard.JustDown(this.keyEnter)) {
+        const myWeapon = this.getWeaponForMe();
+        if (myWeapon === 'grenade' && !this.grenade) {
+          const body = this.creatureBodies[activeId];
+          if (body) {
+            const gx = body.position.x;
+            const gy = body.position.y - 18; // drop slightly above
+            const gBody = this.matter.add.circle(gx, gy, 6, {
+              restitution: 0.6, // bouncy
+              friction: 0.2,    // rolls a bit
+              frictionAir: 0.01,
+              // density: default
+            });
+            (gBody as any).__ent = { type: 'grenade', id: 'grenade' };
+            const gfx = this.add.circle(gx, gy, 6, 0xcccccc).setStrokeStyle(2, 0x333333).setDepth(3);
+            this.grenade = { id: 'grenade', body: gBody, gfx, explodeAt: Date.now() + 5000 };
+            // consume weapon server-side
+            this.room.send('consumeWeapon');
+          }
+        }
       }
       if (Phaser.Input.Keyboard.JustDown(this.cursors.up) || Phaser.Input.Keyboard.JustDown(this.wasd.up)) {
         // Immediate local jump only (no server message)
@@ -244,6 +363,15 @@ class GameScene extends Phaser.Scene {
           updates.push({ id: cid, x: (b as any).position.x, y: (b as any).position.y });
         }
         if (updates.length > 0) this.room.send("worldState", { updates });
+        // Also push crate positions (authoritative while it's our turn)
+        const crateUpdates: { id: string; x: number; y: number }[] = [];
+        for (const [id, b] of Object.entries(this.crateBodies)) {
+          if (!b) continue;
+          crateUpdates.push({ id, x: (b as any).position.x, y: (b as any).position.y });
+          const gfx = this.crateGraphics[id];
+          if (gfx) { gfx.x = (b as any).position.x; gfx.y = (b as any).position.y; }
+        }
+        if (crateUpdates.length > 0) this.room.send('crateState', { updates: crateUpdates });
         this.lastStateSent = time;
       }
     }
@@ -253,6 +381,13 @@ class GameScene extends Phaser.Scene {
       const isActive = id === activeId;
       gfx.setStrokeStyle(isActive ? 4 : 1, isActive ? 0xffff00 : 0x111111);
     });
+
+    // Sync grenade visuals to physics body each frame
+    if (this.grenade && this.grenade.body && this.grenade.gfx) {
+      const p = (this.grenade.body as any).position;
+      this.grenade.gfx.x = p.x;
+      this.grenade.gfx.y = p.y;
+    }
 
     // Backdrop is static (no per-frame resizing for performance)
 
@@ -275,7 +410,7 @@ class GameScene extends Phaser.Scene {
       }
     }
 
-    // Scoreboard: sum HP per player (100 per alive creature)
+    // Scoreboard: sum actual HP per player (sum of each creature's HP)
     const hpByOwner = new Map<string, number>();
     const forEachC = typeof creatures?.forEach === 'function'
       ? creatures.forEach.bind(creatures)
@@ -283,7 +418,8 @@ class GameScene extends Phaser.Scene {
     if (creatures) {
       forEachC((c: Creature) => {
         const cur = hpByOwner.get(c.ownerSessionId) || 0;
-        hpByOwner.set(c.ownerSessionId, cur + 100);
+        const hp = (c as any).hp ?? 100;
+        hpByOwner.set(c.ownerSessionId, cur + Number(hp));
       });
     }
     // Build display list of players from names map (fallback to any owner seen)
@@ -326,6 +462,14 @@ class GameScene extends Phaser.Scene {
     }
 
     // Camera follow / zoom
+    // Grenade explosion timing and cleanup across turn change
+    if (this.room.sessionId === (stateAny).activePlayerSessionId) {
+      this.maybeExplodeGrenade();
+    } else if (this.grenade) {
+      try { if (this.grenade.body) this.matter.world.remove(this.grenade.body); } catch {}
+      if (this.grenade.gfx) this.grenade.gfx.destroy();
+      this.grenade = null;
+    }
     if (Phaser.Input.Keyboard.JustDown(this.keyFollowToggle)) {
       this.followEnabled = !this.followEnabled;
       if (!this.followEnabled) this.cameras.main.stopFollow();
@@ -368,6 +512,44 @@ class GameScene extends Phaser.Scene {
         }
       }
     }
+  }
+
+  private getWeaponForMe(): string | undefined {
+    const stateAny: any = this.room?.state as any;
+    const map: any = stateAny?.weaponsByPlayer || {};
+    const sid = this.room?.sessionId || '';
+    if (!sid) return undefined;
+    const get = typeof map.get === 'function' ? map.get.bind(map) : (k: string) => map[k];
+    return get(sid);
+  }
+
+  private maybeExplodeGrenade() {
+    if (!this.grenade) return;
+    if (Date.now() < this.grenade.explodeAt) return;
+    const gBody = this.grenade.body;
+    const gx = gBody?.position?.x ?? this.grenade.gfx?.x ?? 0;
+    const gy = gBody?.position?.y ?? this.grenade.gfx?.y ?? 0;
+    const MatterBody = (Phaser.Physics.Matter as any).Matter.Body;
+    const hits: { id: string; dmg: number }[] = [];
+    for (const [cid, b] of Object.entries(this.creatureBodies)) {
+      const dx = (b as any).position.x - gx;
+      const dy = (b as any).position.y - gy;
+      const d = Math.hypot(dx, dy);
+      if (d <= this.explosionRadius) {
+        const nx = dx / (d || 1);
+        const ny = dy / (d || 1);
+        const falloff = Math.max(0, 1 - d / this.explosionRadius);
+        const force = this.explosionForce * falloff;
+        MatterBody.applyForce(b, (b as any).position, { x: nx * force, y: ny * force - 0.002 });
+        const dmg = Math.round(100 * falloff);
+        hits.push({ id: cid, dmg });
+      }
+    }
+    if (hits.length > 0) this.room?.send('applyDamage', { hits });
+    // Cleanup grenade visual/body
+    try { if (gBody) this.matter.world.remove(gBody); } catch {}
+    if (this.grenade.gfx) this.grenade.gfx.destroy();
+    this.grenade = null;
   }
 
   private drawTerrain() {
